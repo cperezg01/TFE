@@ -16,6 +16,7 @@ class DataProcessor:
         """Función que descarga datos históricos de Yahoo Finance."""
         print(f"Descargando datos para {self.ticker}...")
         df = yf.download(self.ticker, start=self.start_date, end=self.end_date)
+        df.columns = df.columns.get_level_values(0)
         # Limpieza básica
         df.dropna(inplace=True)
         self.data = df
@@ -54,7 +55,11 @@ class DataProcessor:
         (Número de muestras, Tamaño de ventana, Número de características)
         """
         # Seleccionamos solo las columnas numéricas que queremos usar
-        features = data.values
+        # Si 'data' es un DataFrame, usamos .values; si ya es un array, lo usamos directamente
+        if hasattr(data, 'values'):
+            features = data.values
+        else:
+            features = data
         X = []
         for i in range(len(features) - window_size):
             X.append(features[i : i + window_size])
