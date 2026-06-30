@@ -32,7 +32,7 @@ WEIGHT_DECAY  = 1e-3
 LABEL_SMOOTH  = 0.05
 LAMBDA_REG    = 10.0       # peso de la pérdida de regresión (multitarea)
 
-HORIZON       = 8         # días vista para la dirección
+HORIZON       = 20         # días vista para la dirección
 LABEL_THR     = 0.0
 COVERAGE      = 0.40       # fracción de días con señal direccional (resto HOLD)
 
@@ -49,6 +49,13 @@ SEMAFORO_COLORS = {0: ("#f59e0b", "HOLD"), 1: ("#22c55e", "BUY"), 2: ("#ef4444",
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Dispositivo: {DEVICE}")
+
+ACTION_NAMES = {0: "HOLD", 1: "BUY", 2: "SELL"}
+SEMAFORO_COLORS = {
+    0: ("#f59e0b", "HOLD"), 
+    1: ("#22c55e", "BUY"), 
+    2: ("#ef4444", "SELL")
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. CNN-AE FROZEN
@@ -490,91 +497,62 @@ def main():
     return agent, signals
 
 
-def run_inference(agent, z_sequences, dates, device, coverage=0.50,
-                  q_low=None, q_high=None):
+def run_inference(agent, z_sequences, dates, device, coverage=0.30):
     """
-    Asignación por RANGO de la señal alcista s = P(BUY) - P(SELL):
-      - los k = coverage/2 · N días con s MÁS ALTO  → BUY
-      - los k = coverage/2 · N días con s MÁS BAJO  → SELL
-      - el resto → HOLD
-    Usar el rango (y no umbrales por valor) GARANTIZA que se operen exactamente
-    `coverage`·N días, aunque el modelo colapse y s sea casi constante.
+    Decisión por cuantiles de la señal alcista s = P(BUY) - P(SELL):
+      s alto -> BUY, s bajo -> SELL, intermedio -> HOLD.
+    'coverage' fija la fracción de días con señal direccional (top y bottom coverage/2).
+    Devuelve también r_pred (cabeza de regresión).
     """
     agent.eval()
     P, R = [], []
-    for i in range(len(z_sequences)):
-        x = torch.tensor(z_sequences[i], dtype=torch.float32).unsqueeze(0).to(device)
-        with torch.no_grad():
+    with torch.no_grad():
+        for i in range(len(z_sequences)):
+            x = torch.as_tensor(z_sequences[i], dtype=torch.float32, device=device).unsqueeze(0)
             logits, rpred = agent(x)
-            P.append(F.softmax(logits, dim=-1).squeeze().cpu().numpy())
-            R.append(float(rpred.squeeze().cpu()))
-    P = np.array(P)                         # columnas: [HOLD, BUY, SELL]
-    R = np.array(R, dtype=np.float32)       # retorno log previsto a 1 día
-    score = P[:, 1] - P[:, 2]               # señal alcista
-    n = len(score)
-
-    actions = np.zeros(n, dtype=np.int64)   # 0 = HOLD por defecto
-    if q_low is not None and q_high is not None:
-        lo, hi = np.quantile(score, [q_low, q_high])
-        actions = np.where(score >= hi, 1, np.where(score <= lo, 2, 0))
-    else:
-        coverage = float(np.clip(coverage, 0.0, 1.0))
-        k_tot  = int(round(n * coverage))
-        k_buy  = k_tot // 2
-        k_sell = k_tot - k_buy
-        order  = np.argsort(score, kind="stable")   # ascendente
-        if k_buy  > 0: actions[order[-k_buy:]] = 1   # k mayores → BUY
-        if k_sell > 0: actions[order[:k_sell]] = 2   # k menores → SELL
-
+            P.append(F.softmax(logits, dim=-1).squeeze(0).cpu().numpy())
+            R.append(float(rpred.reshape(-1)[0].cpu()))
+            
+    P = np.asarray(P)                      # Columnas: [HOLD, BUY, SELL]
+    R = np.asarray(R, dtype=float)
+    score = P[:, 1] - P[:, 2]              # Señal neta alcista
+    
+    hi = np.quantile(score, 1.0 - coverage / 2.0)
+    lo = np.quantile(score, coverage / 2.0)
+    
+    actions = np.where(score >= hi, 1, np.where(score <= lo, 2, 0))
+    
     return pd.DataFrame({
-        "date" : dates[:len(actions)],
+        "date":   dates[:len(actions)],
         "action": actions,
-        "label" : [SEMAFORO_COLORS[a][1] for a in actions],
-        "p_hold": P[:, 0], "p_buy": P[:, 1], "p_sell": P[:, 2],
-        "r_pred": R[:len(actions)],
+        "label":  [ACTION_NAMES[a] for a in actions],
+        "p_hold": P[:, 0], 
+        "p_buy":  P[:, 1], 
+        "p_sell": P[:, 2],
+        "r_pred": R,
     }).set_index("date")
 
 
-def apply_trend_gate(signals, df, recon_anomaly=None,
-                     fast=50, dd_lookback=20, dd_thresh=-0.08):
+def apply_trend_gate(signals, df, fast=50, dd_look=20, dd_thr=-0.08):
     """
-    Detección de RÉGIMEN. La métrica FUNDAMENTAL es el ERROR DE RECONSTRUCCIÓN
-    del CNN-AE (parámetro `recon_anomaly`, booleano alineado a signals.index):
-    el AE se entrenó en el periodo estable, así que un error alto = la ventana
-    actual está fuera de distribución = cambio de régimen.
-
-    El error de reconstrucción es DIRECCIONALMENTE NEUTRO: dice "esto es raro",
-    no "sube o baja". Por eso se combina con la SMA(fast), que aporta la
-    dirección, y con el override de drawdown como red de seguridad secundaria:
-      - Régimen normal (recon bajo) Y precio > SMA  → alcista → SELL→HOLD.
-      - Régimen anómalo (recon alto) O precio < SMA → bajista → BUY→HOLD.
-    Si recon_anomaly es None, el gate degrada al comportamiento previo (solo
-    tendencia + drawdown).
+    Régimen alcista si precio > SMA(fast) Y no hay caída brusca reciente.
+      - En régimen alcista:  SELL -> HOLD  (no shortear contra la tendencia).
+      - En régimen bajista:  BUY  -> HOLD  (no comprar en caída libre).
+    El override de drawdown deja pasar los SELL en momentos de pánico (COVID/2022).
     """
     close = df["Close"]
     sma   = close.rolling(fast).mean()
-    ret_r = np.log(close / close.shift(dd_lookback))
-
-    # Componente direccional (tendencia) + red de seguridad de drawdown
-    trend_bullish = (close > sma) & (ret_r > dd_thresh)
-    trend_bullish = trend_bullish.reindex(signals.index).fillna(False).values
-
-    # Métrica fundamental: error de reconstrucción → régimen normal vs anómalo
-    if recon_anomaly is not None:
-        anom = pd.Series(recon_anomaly).reindex(signals.index).fillna(False).values.astype(bool)
-    else:
-        anom = np.zeros(len(signals), dtype=bool)
-
-    # Alcista solo si la tendencia es alcista Y el régimen NO es anómalo
-    bullish = trend_bullish & (~anom)
-
+    ret_r = np.log(close / close.shift(dd_look))
+    
+    bullish = ((close > sma) & (ret_r > dd_thr)).reindex(signals.index).fillna(False).values
+    
     act = signals["action"].values.copy()
-    #act[bullish  & (act == 2)] = 0   # en régimen alcista no shortear
-    #act[~bullish & (act == 1)] = 0   # en régimen bajista/anómalo no comprar
-    act[anom & (act == 1)] = 0   # solo bloquea BUY en régimen anómalo; deja pasar todo lo demás
+    act[bullish  & (act == 2)] = 0
+    act[~bullish & (act == 1)] = 0
+    
     out = signals.copy()
     out["action"] = act
-    out["label"]  = [SEMAFORO_COLORS[a][1] for a in act]
+    out["label"]  = [ACTION_NAMES[a] for a in act]
     return out
 
 
@@ -637,10 +615,3 @@ def plot_semaforo(signals, close_prices, title="Semáforo bursátil — IBEX 35"
     plt.tight_layout(); plt.savefig("semaforo_ibex.png", dpi=150, bbox_inches="tight")
     plt.show()
     print("Gráfico guardado en semaforo_ibex.png")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EJECUCIÓN
-# ══════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    main()
-
