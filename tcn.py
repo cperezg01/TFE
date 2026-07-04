@@ -419,7 +419,7 @@ def main():
     z_train, z_test = z_train[:len(fwd_train)], z_test[:len(fwd_test)]
 
     # Retorno del día siguiente (objetivo de la regresión), mismo alineado
-    r1_train = forward_returns(close_train, DEC_OFFSET, len(z_train), 1)
+    r1_train = forward_returns(close_train, DEC_OFFSET, len(z_train), HORIZON)
     test_dec_dates = test_df.index[DEC_OFFSET: DEC_OFFSET + len(z_test)]
     print(f"   z_train: {z_train.shape} | z_test: {z_test.shape}")
 
@@ -478,7 +478,7 @@ def main():
     c = close_test.values
     d_idx = DEC_OFFSET + np.arange(len(signals))
     pred_price  = c[d_idx] * np.exp(signals["r_pred"].values)
-    true_price  = c[d_idx + 1]
+    true_price  = c[d_idx + HORIZON]
     naive_price = c[d_idx]                       # persistencia: "mañana = hoy"
     reg   = regression_metrics(pred_price,  true_price)
     naive = regression_metrics(naive_price, true_price)
